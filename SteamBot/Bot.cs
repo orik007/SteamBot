@@ -45,6 +45,7 @@ namespace SteamBot
         private bool cookiesAreInvalid = true;
         private List<SteamID> friends;
         private bool disposed = false;
+        private string consoleInput;
         #endregion
 
         #region Public readonly variables
@@ -112,6 +113,8 @@ namespace SteamBot
         /// Default: 0 = No game.
         /// </summary>
         public int CurrentGame { get; private set; }
+
+        public SteamAuth.SteamGuardAccount SteamGuardAccount;
         #endregion
 
         public IEnumerable<SteamID> FriendsList
@@ -190,7 +193,7 @@ namespace SteamBot
             // Hacking around https
             ServicePointManager.ServerCertificateValidationCallback += SteamWeb.ValidateRemoteCertificate;
 
-            Log.Debug ("Initializing Steam Bot...");
+            Log.Debug ("Initializing Steam Bot...");            
             SteamClient = new SteamClient();
             SteamClient.AddHandler(new SteamNotifications());
             SteamTrade = SteamClient.GetHandler<SteamTrading>();
@@ -319,7 +322,40 @@ namespace SteamBot
         {
             try
             {
-                GetUserHandler(SteamClient.SteamID).OnBotCommand(command);
+                if (command == "linkauth")
+                {
+                    LinkMobileAuth();
+                }
+                else if (command == "getauth")
+                {
+                    try
+                    {
+                        Log.Success("Generated Steam Guard code: " + SteamGuardAccount.GenerateSteamGuardCode());
+                    }
+                    catch (NullReferenceException)
+                    {
+                        Log.Error("Unable to generate Steam Guard code.");
+                    }
+                }
+                else if (command == "unlinkauth")
+                {
+                    if (SteamGuardAccount == null)
+                    {
+                        Log.Error("Mobile authenticator is not active on this bot.");
+                    }
+                    else if (SteamGuardAccount.DeactivateAuthenticator())
+                    {
+                        Log.Success("Deactivated authenticator on this account.");
+                    }
+                    else
+                    {
+                        Log.Error("Failed to deactivate authenticator on this account.");
+                    }
+                }
+                else
+                {
+                    GetUserHandler(SteamClient.SteamID).OnBotCommand(command);
+                }
             }
             catch (ObjectDisposedException e)
             {
@@ -333,6 +369,24 @@ namespace SteamBot
             catch (Exception e)
             {
                 Console.WriteLine(string.Format("Exception caught in BotCommand Thread: {0}", e));
+            }
+        }
+
+        public void HandleInput(string input)
+        {
+            consoleInput = input;
+        }
+
+        public string WaitForInput()
+        {
+            consoleInput = null;
+            while (true)
+            {
+                if (consoleInput != null)
+                {
+                    return consoleInput;
+                }
+                Thread.Sleep(5);
             }
         }
 
@@ -419,7 +473,26 @@ namespace SteamBot
                     Log.Error("Login Error: {0}", callback.Result);
                 }
 
-                if (callback.Result == EResult.AccountLogonDenied)
+                if (callback.Result == EResult.AccountLogonDeniedNeedTwoFactorCode)
+                {
+                    var mobileAuthCode = GetMobileAuthCode();
+                    if (string.IsNullOrEmpty(mobileAuthCode))
+                    {
+                        Log.Error("Failed to generate 2FA code. Make sure you have linked the authenticator via SteamBot.");
+                    }
+                    else
+                    {
+                        logOnDetails.TwoFactorCode = mobileAuthCode;
+                        Log.Success("Generated 2FA code.");
+                    }
+                }
+                else if (callback.Result == EResult.TwoFactorCodeMismatch)
+                {
+                    SteamAuth.TimeAligner.AlignTime();
+                    logOnDetails.TwoFactorCode = SteamGuardAccount.GenerateSteamGuardCode();
+                    Log.Success("Regenerated 2FA code.");
+                }
+                else if (callback.Result == EResult.AccountLogonDenied)
                 {
                     Log.Interface ("This account is SteamGuard enabled. Enter the code via the `auth' command.");
 
@@ -431,8 +504,7 @@ namespace SteamBot
                     else
                         logOnDetails.AuthCode = Console.ReadLine();
                 }
-
-                if (callback.Result == EResult.InvalidLoginAuthCode)
+                else if (callback.Result == EResult.InvalidLoginAuthCode)
                 {
                     Log.Interface("The given SteamGuard code was invalid. Try again using the `auth' command.");
                     logOnDetails.AuthCode = Console.ReadLine();
@@ -680,6 +752,99 @@ namespace SteamBot
             #endregion
         }
 
+        string GetMobileAuthCode()
+        {
+            var authFile = Path.Combine("authfiles", String.Format("{0}.auth", logOnDetails.Username));
+            if (File.Exists(authFile))
+            {
+                SteamGuardAccount = Newtonsoft.Json.JsonConvert.DeserializeObject<SteamAuth.SteamGuardAccount>(File.ReadAllText(authFile));
+                return SteamGuardAccount.GenerateSteamGuardCode();
+            }
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Link a mobile authenticator to bot account, using SteamTradeOffersBot as the authenticator.
+        /// Called from bot manager console. Usage: "exec [index] linkauth"
+        /// If successful, 2FA will be required upon the next login.
+        /// Use "exec [index] getauth" if you need to get a Steam Guard code for the account.
+        /// To deactivate the authenticator, use "exec [index] unlinkauth".
+        /// </summary>
+        void LinkMobileAuth()
+        {
+            new Thread(() =>
+            {
+                var login = new SteamAuth.UserLogin(logOnDetails.Username, logOnDetails.Password);
+                var loginResult = login.DoLogin();
+                if (loginResult == SteamAuth.LoginResult.NeedEmail)
+                {
+                    while (loginResult == SteamAuth.LoginResult.NeedEmail)
+                    {
+                        Log.Interface("Enter Steam Guard code from email (type \"input [index] [code]\"):");
+                        var emailCode = WaitForInput();
+                        login.EmailCode = emailCode;
+                        loginResult = login.DoLogin();
+                    }
+                }
+                if (loginResult == SteamAuth.LoginResult.LoginOkay)
+                {
+                    Log.Info("Linking mobile authenticator...");
+                    var authLinker = new SteamAuth.AuthenticatorLinker(login.Session);
+                    var addAuthResult = authLinker.AddAuthenticator();
+                    if (addAuthResult == SteamAuth.AuthenticatorLinker.LinkResult.MustProvidePhoneNumber)
+                    {
+                        while (addAuthResult == SteamAuth.AuthenticatorLinker.LinkResult.MustProvidePhoneNumber)
+                        {
+                            Log.Interface("Enter phone number with country code, e.g. +1XXXXXXXXXXX (type \"input [index] [number]\"):");
+                            var phoneNumber = WaitForInput();
+                            authLinker.PhoneNumber = phoneNumber;
+                            addAuthResult = authLinker.AddAuthenticator();
+                        }
+                    }
+                    if (addAuthResult == SteamAuth.AuthenticatorLinker.LinkResult.AwaitingFinalization)
+                    {
+                        SteamGuardAccount = authLinker.LinkedAccount;
+                        try
+                        {
+                            var authFile = Path.Combine("authfiles", String.Format("{0}.auth", logOnDetails.Username));
+                            Directory.CreateDirectory(Path.Combine(System.Windows.Forms.Application.StartupPath, "authfiles"));
+                            File.WriteAllText(authFile, Newtonsoft.Json.JsonConvert.SerializeObject(SteamGuardAccount));
+                            Log.Interface("Enter SMS code (type \"input [index] [code]\"):");
+                            var smsCode = WaitForInput();
+                            var authResult = authLinker.FinalizeAddAuthenticator(smsCode);
+                            if (authResult == SteamAuth.AuthenticatorLinker.FinalizeResult.Success)
+                            {
+                                Log.Success("Linked authenticator.");
+                            }
+                            else
+                            {
+                                Log.Error("Error linking authenticator: " + authResult);
+                            }
+                        }
+                        catch (IOException)
+                        {
+                            Log.Error("Failed to save auth file. Aborting authentication.");
+                        }                        
+                    }
+                    else
+                    {
+                        Log.Error("Error adding authenticator: " + addAuthResult);
+                    }
+                }
+                else
+                {
+                    if (loginResult == SteamAuth.LoginResult.Need2FA)
+                    {
+                        Log.Error("Mobile authenticator has already been linked!");
+                    }
+                    else
+                    {
+                        Log.Error("Error performing mobile login: " + loginResult);
+                    }
+                }
+            }).Start();
+        }
+
         void UserLogOn()
         {
             // get sentry file which has the machine hw info saved 
@@ -847,7 +1012,7 @@ namespace SteamBot
         public void SubscribeTrade (Trade trade, UserHandler handler)
         {
             trade.OnSuccess += handler.OnTradeSuccess;
-            trade.OnAwaitingEmailConfirmation += handler.OnTradeAwaitingEmailConfirmation;
+            trade.OnAwaitingConfirmation += handler._OnTradeAwaitingConfirmation;
             trade.OnClose += handler.OnTradeClose;
             trade.OnError += handler.OnTradeError;
             trade.OnStatusError += handler.OnStatusError;
@@ -866,7 +1031,7 @@ namespace SteamBot
         public void UnsubscribeTrade (UserHandler handler, Trade trade)
         {
             trade.OnSuccess -= handler.OnTradeSuccess;
-            trade.OnAwaitingEmailConfirmation -= handler.OnTradeAwaitingEmailConfirmation;
+            trade.OnAwaitingConfirmation -= handler._OnTradeAwaitingConfirmation;
             trade.OnClose -= handler.OnTradeClose;
             trade.OnError -= handler.OnTradeError;
             trade.OnStatusError -= handler.OnStatusError;
@@ -890,6 +1055,33 @@ namespace SteamBot
                 log.Warn("The bot's backpack is private! If your bot adds any items it will fail! Your bot's backpack should be Public.");
             }
             return inventory;
+        }
+
+        public void AcceptAllMobileTradeConfirmations()
+        {
+            if (SteamGuardAccount == null)
+            {
+                Log.Warn("Bot account does not have 2FA enabled.");
+            }
+            else
+            {
+                SteamGuardAccount.Session.SteamLogin = SteamWeb.Token;
+                SteamGuardAccount.Session.SteamLoginSecure = SteamWeb.TokenSecure;
+                try
+                {
+                    foreach (var confirmation in SteamGuardAccount.FetchConfirmations())
+                    {
+                        if (SteamGuardAccount.AcceptConfirmation(confirmation))
+                        {
+                            Log.Success("Confirmed {0}. (Confirmation ID #{1})", confirmation.ConfirmationDescription, confirmation.ConfirmationID);
+                        }
+                    }
+                }
+                catch (SteamAuth.SteamGuardAccount.WGTokenInvalidException)
+                {
+                    Log.Error("Invalid session when trying to fetch trade confirmations.");
+                }
+            }                        
         }
 
         #region Background Worker Methods
